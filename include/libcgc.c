@@ -17,20 +17,90 @@
 #include <unistd.h>
 #include <err.h>
 
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) < (b)) ? (b) : (a))
 
-#ifndef SIGPWR
-# define SIGPWR 0
-#endif
+#ifdef __linux__
+# include <ucontext.h>
 
-enum {
-    k2GiB = 2147483648
-};
+/* Notifies a signal handler that a memory read or write is recoverable. */
+static int gInTryAccess = 0;
 
-static uintptr_t gMemBegin = 0;
-static uintptr_t gMemEnd = 0;
-static uint8_t gMappedPages[(k2GiB / PAGE_SIZE) / 8] = {0};
+/* Opportunistically try to write a byte to memory, and provide a recovery
+ * path for segfaults. */
+static int try_write(uint8_t *ptr, uint8_t val) {
+  int ret = 0;
+  gInTryAccess = 1;
+  __asm__ __volatile__ (
+    "jmp 1f;"
+    ".align 16, 0x90;"
+    "1:"
+    "movb %0, (%1);"
+    "jmp 2f;"
+    ".align 16, 0x90;"
+    "2:"
+    :
+    : "r"(val), "r"(ptr)
+    : "memory"
+  );
+  ret = gInTryAccess;
+  gInTryAccess = 0;
+  return ret;
+}
+
+/* Opportunistically try to read a byte to memory, and provide a recovery
+ * path for segfaults. */
+static int try_read(const uint8_t *ptr, uint8_t *val) {
+  uint8_t read_val = 0;
+  int ret = 0;
+
+  gInTryAccess = 1;
+  __asm__ __volatile__ (
+    "jmp 1f;"
+    ".align 16, 0x90;"
+    "1:"
+    "movb (%0), %1;"
+    "jmp 2f;"
+    ".align 16, 0x90;"
+    "2:"
+    :
+    : "r"(ptr), "r"(read_val)
+    : "memory"
+  );
+  ret = gInTryAccess;
+  fault_can_recover = 0;
+  if (ret && val) {
+    *val = read_val;
+  }
+  return ret;
+}
+
+/* Catch and try to handle a segfault. */
+static void catch_fault(int sig, siginfo_t *info, void *context_) {
+  (void) sig;
+  (void) info;
+  if (gInTryAccess) {
+    gInTryAccess = 0;
+    ucontext_t *context = (ucontext_t *) context_;
+    context->uc_mcontext.gregs[REG_RIP] += 16;  // Return to recovery code.
+  }
+}
+
+#else
+
+/* TODO(withzombies): Add macOS or Windows API calls. */
+static int try_write(uint8_t *ptr, uint8_t val) {
+  *ptr = val;
+  return 1;
+}
+
+/* TODO(withzombies): Add macOS or Windows API calls. */
+static int try_read(const uint8_t *ptr, uint8_t *val) {
+  *val = *ptr;
+  return 1;
+}
+#endif  /* ! __linux__ */
 
 /* Reserve a large slab of memory that we'll use for doling out allocations.
  * The CGC allocator, for the most part, is a bump pointer allocator, returning
@@ -39,85 +109,25 @@ static uint8_t gMappedPages[(k2GiB / PAGE_SIZE) / 8] = {0};
  */
 static void init_memory(void) {
   errno = 0;
-  cgc_size_t alloc_size = k2GiB;
-  int errno_val = ENOMEM;
-  void *mem = NULL;
-  for (; errno_val && alloc_size; alloc_size /= 2) {
-    mem = mmap(NULL, alloc_size, PROT_NONE,
-               MAP_PRIVATE | MAP_ANONYMOUS,  /* TODO(pag): MAP_32BIT? */
-               -1, 0);
-    errno_val = errno;
-    errno = 0;
-  }
-
-  if (!mem || !alloc_size || errno_val) {
-    exit(EXIT_FAILURE);
-  }
-
-  gMemBegin = (uintptr_t) mem;
-  gMemEnd = gMemBegin + alloc_size;
-}
-
-static int test_page(uintptr_t addr) {
-  const cgc_size_t page = (addr - gMemBegin) / PAGE_SIZE;
-  const cgc_size_t byte = page / 8;
-  const cgc_size_t bit = page % 8;
-  return 0 != (gMappedPages[byte] & (1U << bit));
-}
-
-static void set_page(uintptr_t addr) {
-  const cgc_size_t page = (addr - gMemBegin) / PAGE_SIZE;
-  const cgc_size_t byte = page / 8;
-  const cgc_size_t bit = page % 8;
-  gMappedPages[byte] |= 1U << bit;
-}
-
-static void clear_page(uintptr_t addr) {
-  const cgc_size_t page = (addr - gMemBegin) / PAGE_SIZE;
-  const cgc_size_t byte = page / 8;
-  const cgc_size_t bit = page % 8;
-  gMappedPages[byte] &= ~(1U << bit);
+#ifdef __linux__
+  struct sigaction sig;
+  sig.sa_sigaction = catch_fault;
+  sig.sa_flags = SA_SIGINFO;
+  sig.sa_restorer = NULL;
+  sigfillset(&(sig.sa_mask));
+  sigaction(SIGSEGV, &sig, nullptr);
+#endif  // __linux__
 }
 
 
-/* Returns `1` if a page is readable, otherwise `0`.
- *
- * TODO(pag): Use `select` instead for portability? */
+/* Returns `1` if a page is readable, otherwise `0`. */
 static int page_is_readable(const void *ptr) {
-  const uintptr_t addr = (uintptr_t) ptr;
-  if (!addr) return 0;
-  if (gMemBegin <= addr && addr < gMemEnd) {
-    return test_page(addr);
-  }
-
-  errno = 0;
-  sigaction(SIGPWR, ptr, NULL);  /* SIGPWR is rarely used. */
-  const int errno_val = errno;
-  errno = 0;
-  return EFAULT != errno_val;
+  return try_read((uint8_t *) ptr, NULL);
 }
 
-/* Returns `1` if a page is writable, otherwise `0`.
- *
- * TODO(pag): Use `fstat` instead for portability? */
+/* Returns `1` if a page is writable, otherwise `0`. */
 static int page_is_writable(void *ptr) {
-  const uintptr_t addr = (uintptr_t) ptr;
-  if (!addr) return 0;
-  if (gMemBegin <= addr && addr < gMemEnd) {
-    return test_page(addr);
-  }
-  uint8_t mem[sizeof(struct sigaction)];
-  memcpy(&(mem[0]), ptr, sizeof(struct sigaction));
-  errno = 0;
-  sigaction(SIGPWR, NULL, ptr);  /* SIGPWR is rarely used. */
-  const int errno_val = errno;
-  errno = 0;
-  if (EFAULT != errno_val) {
-    memcpy(ptr, &(mem[0]), sizeof(struct sigaction));
-    return 1;
-  } else {
-    return 0;
-  }
+  return try_write((uint8_t *) ptr, 0);
 }
 
 /* Returns the number of readable bytes pointed to by `ptr`, up to a maximum
