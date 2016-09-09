@@ -102,12 +102,18 @@ static int try_read(const uint8_t *ptr, uint8_t *val) {
 }
 #endif  /* ! __linux__ */
 
+static int gMemoryInitialized = 0;
+
 /* Reserve a large slab of memory that we'll use for doling out allocations.
  * The CGC allocator, for the most part, is a bump pointer allocator, returning
  * pages from a contiguous range. There are some edge cases, e.g. the stack,
  * high memory pressure, etc.
  */
 static void init_memory(void) {
+  if (gMemoryInitialized) {
+    return;
+  }
+  gMemoryInitialized = 1;
   errno = 0;
 #ifdef __linux__
   struct sigaction sig;
@@ -192,6 +198,8 @@ static int update_byte_count(cgc_size_t *counter, cgc_size_t count) {
 
 /* Transmits data from one CGC process to another. */
 int transmit(int fd, const void *buf, cgc_size_t count, cgc_size_t *tx_bytes) {
+  init_memory();
+  
   if (!count) {
     return update_byte_count(tx_bytes, 0);
   } else if (0 > fd) {
@@ -225,6 +233,8 @@ int transmit(int fd, const void *buf, cgc_size_t count, cgc_size_t *tx_bytes) {
 
 /* Receives data from another CGC process. */
 int receive(int fd, void *buf, cgc_size_t count, cgc_size_t *rx_bytes) {
+  init_memory();
+
   if (!count) {
     return update_byte_count(rx_bytes, 0);
   } else if (0 > fd) {
@@ -303,6 +313,8 @@ static void copy_os_fd_set(const fd_set *os_fds, cgc_fd_set *cgc_fds) {
 }
 int cgc_fdwait(int nfds, cgc_fd_set *readfds, cgc_fd_set *writefds,
                const struct cgc_timeval *timeout, int *readyfds) {
+
+  init_memory();
 
   int ret = check_timeout(timeout);
   int actual_num_fds = 0;
@@ -385,13 +397,23 @@ int cgc_fdwait(int nfds, cgc_fd_set *readfds, cgc_fd_set *writefds,
   return 0;
 }
 
-/* Perform a backing memory allocation. */
-static int do_allocate(uintptr_t start, cgc_size_t size, void **addr) {
-  void *ret_addr = (void *) start;
-//  printf("do_allocate: size=%x\n", size);
-  errno = 0;
-  void *mmap_addr = mmap(ret_addr, size, PROT_READ | PROT_WRITE,
-                         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#define PAGE_ALIGN(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
+
+/* Going to ignore `is_executable`. It's not really used in the official CGC
+ * challenges, and if it were used, then JITed code would likely be 32-bit, and
+ * ideally, this code will also work on 64-bit.
+ */
+int allocate(cgc_size_t length, int is_executable, void **addr) {
+  init_memory();
+  if (!length) {
+    return CGC_EINVAL;
+  }
+
+  length = PAGE_ALIGN(length);  /* Might overflow. */
+
+  void *mmap_addr = mmap(0, length, PROT_READ | PROT_WRITE,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
   const int errno_val = errno;
   errno = 0;
 
@@ -401,96 +423,26 @@ static int do_allocate(uintptr_t start, cgc_size_t size, void **addr) {
     } else {
       return CGC_EINVAL;
     }
-  } else if (mmap_addr != ret_addr) {
-    exit(EXIT_FAILURE);  /* Not much to do about this :-/ */
   }
 
-  for (uintptr_t end = start + size; start < end; start += PAGE_SIZE) {
-    set_page(start);
-  }
   if (addr) {
-    if (!OBJECT_IS_WRITABLE(addr)) {
-      return CGC_EFAULT;
-    }
-    *addr = ret_addr;
+    *addr = mmap_addr;
   }
+
   return 0;
-}
-
-#define PAGE_ALIGN(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
-
-/* Going to ignore `is_executable`. It's not really used in the official CGC
- * challenges, and if it were used, then JITed code would likely be 32-bit, and
- * ideally, this code will also work on 64-bit.
- */
-int allocate(cgc_size_t length, int is_executable, void **addr) {
-  if (!length) {
-    return CGC_EINVAL;
-  } else if (!gMemBegin) {
-    init_memory();
-  }
-
-//  printf("do_allocate: length=%x\n", length);
-  length = PAGE_ALIGN(length);  /* Might overflow. */
-
-  if (!length || length >= (gMemEnd - gMemBegin)) {
-    return CGC_EINVAL;  /* Too big of a request! */
-  }
-
-  cgc_size_t run_length = 0;
-  for (cgc_size_t start = gMemEnd - PAGE_SIZE;
-       start >= gMemBegin;
-       start -= PAGE_SIZE) {
-    if (test_page(start)) {
-      run_length = 0;
-    } else {
-      run_length += PAGE_SIZE;
-      if (run_length >= length) {
-        return do_allocate(start, length, addr);
-      }
-    }
-  }
-  return CGC_ENOMEM;
 }
 
 /* Deallocate some range of memory and mark the pages as free. */
 int deallocate(void *addr, cgc_size_t length) {
+  init_memory();
+
   uintptr_t base = (uintptr_t) addr;
   if (!length || base != PAGE_ALIGN(base)) {
     return CGC_EINVAL;
   }
 
-  if (!gMemBegin) {
-    init_memory();
-  }
-
   length = PAGE_ALIGN(length);
-  uintptr_t limit = base + length;
-
-  if (limit <= gMemBegin || gMemEnd <= base) {
-    return CGC_EINVAL;
-  } else {
-    base = MAX(base, gMemBegin);
-    limit = MIN(limit, gMemEnd);
-  }
-
-  errno = 0;
-  void *mmap_addr = mmap(addr, length, PROT_NONE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  const int errno_val = errno;
-  errno = 0;
-
-  if (errno_val) {
-    return CGC_EINVAL;
-  } else if (addr != mmap_addr) {
-    exit(EXIT_FAILURE);  /* Not much to do here. */
-  }
-
-  for (; base < limit; base += PAGE_SIZE) {
-    clear_page(base);
-  }
-
-  return 0;
+  return munmap(addr, length);
 }
 
 
@@ -524,6 +476,7 @@ void try_init_prng() {
 }
 
 int cgc_random(void *buf, cgc_size_t count, cgc_size_t *rnd_bytes) {
+  init_memory();
   if (!count) {
     return update_byte_count(rnd_bytes, 0);
   } else if (count > SSIZE_MAX) {
@@ -539,6 +492,7 @@ int cgc_random(void *buf, cgc_size_t count, cgc_size_t *rnd_bytes) {
 }
 
 void *cgc_initialize_secret_page(void) {
+  init_memory();
   const void * MAGIC_PAGE_ADDRESS = (void *)0x4347C000;
   const size_t MAGIC_PAGE_SIZE = 4096;
 
